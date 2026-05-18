@@ -376,15 +376,15 @@ def navigation_loop():
                     last_block_print = now
                 stuck_frames = 0
             else:
-                if is_running and abs(turn) < 15:
+                if is_running and abs(turn) < 25:
                     if prev_gray is not None:
                         diff = cv2.absdiff(gray, prev_gray)
-                        if np.mean(diff) < 1.5:
+                        if np.mean(diff) < 3.0:
                             stuck_frames += 1
                         else:
                             stuck_frames = 0
                         
-                        if stuck_frames > 40:
+                        if stuck_frames > 25:
                             print("[Nav] Stuck detected! Executing shake-off maneuver...")
                             robot_send("STOP")
                             time.sleep(0.2)
