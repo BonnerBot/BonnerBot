@@ -54,10 +54,19 @@ def init_cam(idx, w, h, fps):
     return c
 
 # ── Audio ─────────────────────────────────────────────────────────────────────
-AUDIO_FOLDER  = os.path.expanduser("~/audioclips")
-MANUAL_FOLDER = os.path.expanduser("~/audioclips-manual")
+AUDIO_FOLDER      = os.path.expanduser("~/audioclips")
+MANUAL_FOLDER     = os.path.expanduser("~/audioclips-manual")
+VOICELINES_FOLDER = os.path.expanduser("~/voicelines")
 PROXIMITY_THRESHOLD = 0.45
 AUDIO_COOLDOWN      = 20
+
+# Which folder is used as the random-cue pool: "auto" (audioclips) or "voicelines"
+active_random_source      = "auto"
+active_random_source_lock = threading.Lock()
+
+# Shuffle-bag: play every clip once before repeating
+_shuffle_bag      = []   # remaining clips in current shuffle cycle
+_shuffle_bag_lock = threading.Lock()
 
 detectr_enabled = False
 detectr_lock    = threading.Lock()
@@ -195,20 +204,8 @@ def detect_ceiling_markers(frame_bgr):
                 break
         if corner_id:
             break
+    return corner_id
 
-    # Detect ceiling lights (bright white panels)
-    light_mask = cv2.inRange(hsv, np.array([0, 0, 200]), np.array([180, 50, 255]))
-    contours, _ = cv2.findContours(light_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    light_seen = False
-    for cnt in contours:
-        shape = classify_contour(cnt)
-        if shape == "rectangle" and cv2.contourArea(cnt) > MARKER_MIN_AREA:
-            light_seen = True
-            break
-            
-    return corner_id, light_seen
-
-_light_cooldown = 0
 
 def compute_centering_turn(frame_gray):
     """
@@ -250,7 +247,8 @@ def compute_centering_turn(frame_gray):
         M = cv2.moments(target)
         if M["m00"] > 0:
             cX = int(M["m10"] / M["m00"])
-            error = (cX - (w / 2)) / (w / 2)
+            # Small rightward bias (+3%) to correct persistent left drift
+            error = (cX - (w / 2)) / (w / 2) - 0.03
             
             # Proportional steering
             turn = int(error * 25)
@@ -274,11 +272,11 @@ def execute_turn(action):
         robot_send("STOP")
         return
 
-    time.sleep(0.65)
+    time.sleep(0.55)
     robot_send("STOP")
 
 def navigation_loop():
-    global _light_cooldown, current_hallway, current_light_counter
+    global current_hallway, current_light_counter
     cooldown_frames   = 0
     armed_landmark    = None
     armed_frame_count = 0          # counts frames since landmark was armed
@@ -312,10 +310,9 @@ def navigation_loop():
         # ── Ceiling marker detection ───────────────────────────────────────────
         with ceiling_frame_lock: c_frame = ceiling_frame
         corner_seen = None
-        light_seen  = False
         if c_frame is not None:
             try:
-                corner_seen, light_seen = detect_ceiling_markers(c_frame)
+                corner_seen = detect_ceiling_markers(c_frame)
             except Exception as e:
                 print(f"[Ceiling] Detection error: {e}")
 
@@ -327,7 +324,7 @@ def navigation_loop():
             consecutive_corners = 1
         confirmed_corner = corner_seen if consecutive_corners >= CORNER_CONFIRM_FRAMES else None
 
-        # ── Hallway / Light logic ──────────────────────────────────────────────
+        # ── Hallway logic ──────────────────────────────────────────────────────
         # Only update hallway when NOT in turn cooldown to prevent flickering
         if cooldown_frames == 0 and confirmed_corner:
             new_hallway = confirmed_corner[3:]
@@ -336,15 +333,6 @@ def navigation_loop():
                     current_hallway = new_hallway
                     current_light_counter = 0
                     print(f"[Nav] Entered hallway {current_hallway}, light counter reset.")
-        
-        if _light_cooldown > 0:
-            _light_cooldown -= 1
-        elif light_seen:
-            with nav_location_lock:
-                current_light_counter += 1
-                light_num = current_light_counter
-            _light_cooldown = 30  # cooldown before counting next light
-            print(f"[Ticker] Passed light panel #{light_num}")
 
         # ── Corner / turn logic ────────────────────────────────────────────────
         if cooldown_frames > 0:
@@ -359,10 +347,13 @@ def navigation_loop():
                 armed_frame_count += 1
                 print(f"[NavCeiling] Approaching corner {armed_landmark} — frame {armed_frame_count}/{APPROACH_FRAMES}")
                 if armed_frame_count >= APPROACH_FRAMES:
-                    # Enough time has passed to reach the corner — execute the turn
+                    # Enough time has passed to reach the corner — execute the turn.
+                    # Ignore person_blocking here: the robot is committed to the corner
+                    # and has already stopped; a person in the threshold zone at this
+                    # instant should not abort the turn.
                     print(f"[NavCeiling] Executing turn for: {armed_landmark}")
                     robot_send("STOP")
-                    time.sleep(0.3)
+                    time.sleep(0.55)
                     if armed_landmark in TOPOLOGICAL_MAP:
                         execute_turn(TOPOLOGICAL_MAP[armed_landmark]["action"])
                     time.sleep(0.5)
@@ -461,23 +452,40 @@ def robot_send(cmd: str) -> str:
 def get_clips_from(folder):
     return sorted(
         glob.glob(os.path.join(folder, "*.mp3")) +
-        glob.glob(os.path.join(folder, "*.wav"))
+        glob.glob(os.path.join(folder, "*.wav")) +
+        glob.glob(os.path.join(folder, "*.m4a"))
     )
 
 def stop_audio():
-    subprocess.run(["pkill", "-x", "mpg123"], stderr=subprocess.DEVNULL)
-    subprocess.run(["pkill", "-x", "aplay"],  stderr=subprocess.DEVNULL)
+    subprocess.run(["pkill", "-x", "mpg123"],  stderr=subprocess.DEVNULL)
+    subprocess.run(["pkill", "-x", "aplay"],   stderr=subprocess.DEVNULL)
+    subprocess.run(["pkill", "-x", "ffplay"],  stderr=subprocess.DEVNULL)
 
 def play_clip(path):
     stop_audio()
     ext = os.path.splitext(path)[1].lower()
     print(f"Playing: {os.path.basename(path)}")
-    if ext == ".mp3": subprocess.Popen(["mpg123", "-q", path])
+    if ext == ".mp3":  subprocess.Popen(["mpg123", "-q", path])
     elif ext == ".wav": subprocess.Popen(["aplay",  "-q", path])
+    elif ext == ".m4a": subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path])
 
 def play_random_clip():
-    clips = get_clips_from(AUDIO_FOLDER)
-    if clips: play_clip(random.choice(clips))
+    global _shuffle_bag
+    with active_random_source_lock:
+        src = active_random_source
+    folder = VOICELINES_FOLDER if src == "voicelines" else AUDIO_FOLDER
+    clips = get_clips_from(folder)
+    if not clips:
+        return
+    with _shuffle_bag_lock:
+        # Refill and reshuffle when the bag is empty or the folder changed
+        remaining = [c for c in _shuffle_bag if c in clips]
+        if not remaining:
+            remaining = clips[:]
+            random.shuffle(remaining)
+        next_clip = remaining.pop(0)
+        _shuffle_bag = remaining
+    play_clip(next_clip)
 
 def try_trigger_audio(box_h, frame_h):
     global last_audio_time
@@ -782,14 +790,20 @@ def api_detections():
 
 @app.route('/play')
 def play_random():
-    clips = get_clips_from(AUDIO_FOLDER)
-    if not clips: return jsonify({"message": "No clips in ~/audioclips"})
+    with active_random_source_lock:
+        src = active_random_source
+    folder = VOICELINES_FOLDER if src == "voicelines" else AUDIO_FOLDER
+    clips = get_clips_from(folder)
+    label = "voicelines" if src == "voicelines" else "audioclips"
+    if not clips: return jsonify({"message": f"No clips in ~/{label}"})
     threading.Thread(target=play_random_clip, daemon=True).start()
-    return jsonify({"message": "Playing random clip..."})
+    return jsonify({"message": f"Playing random clip from {label}..."})
 
 @app.route('/play/<folder>/<filename>')
 def play_specific(folder, filename):
-    base = AUDIO_FOLDER if folder == "auto" else MANUAL_FOLDER
+    if folder == "auto":        base = AUDIO_FOLDER
+    elif folder == "voicelines": base = VOICELINES_FOLDER
+    else:                       base = MANUAL_FOLDER
     path = os.path.join(base, filename)
     if not os.path.exists(path): return jsonify({"message": f"Not found: {filename}"})
     threading.Thread(target=play_clip, args=(path,), daemon=True).start()
@@ -800,11 +814,22 @@ def stop():
     stop_audio()
     return jsonify({"message": "Audio stopped."})
 
+@app.route('/api/set_random_source/<source>')
+def set_random_source(source):
+    global active_random_source
+    if source not in ("auto", "voicelines"):
+        return jsonify({"message": f"Unknown source '{source}'"}), 400
+    with active_random_source_lock:
+        active_random_source = source
+    label = "Voice Lines" if source == "voicelines" else "Audio Clips"
+    return jsonify({"source": source, "message": f"Random cue source: {label}"})
+
 @app.route('/clips')
 def clips():
-    auto   = [{"name": os.path.basename(p), "folder": "auto"}   for p in get_clips_from(AUDIO_FOLDER)]
-    manual = [{"name": os.path.basename(p), "folder": "manual"} for p in get_clips_from(MANUAL_FOLDER)]
-    return jsonify({"clips": auto + manual})
+    auto       = [{"name": os.path.basename(p), "folder": "auto"}       for p in get_clips_from(AUDIO_FOLDER)]
+    manual     = [{"name": os.path.basename(p), "folder": "manual"}     for p in get_clips_from(MANUAL_FOLDER)]
+    voicelines = [{"name": os.path.basename(p), "folder": "voicelines"} for p in get_clips_from(VOICELINES_FOLDER)]
+    return jsonify({"clips": auto + manual + voicelines})
 
 @app.route('/volume/<int:level>')
 def set_volume(level):
@@ -1023,6 +1048,12 @@ table.det-log tr:hover td{background:#232323}
       <button class="btn-red"  onclick="stopAudio()">&#9632; Stop Audio</button>
       <button class="btn-grey" id="micBtn" onclick="toggleMic()">&#127908; Mic</button>
     </div>
+    <!-- Random source toggle -->
+    <div class="row" style="margin-top:4px">
+      <span style="font-size:.82rem;color:#aaa">Random Source:</span>
+      <button class="btn-grey" id="srcAutoBtn"  onclick="setRandomSource('auto')">&#127925; Audio Clips</button>
+      <button class="btn-grey" id="srcVoiceBtn" onclick="setRandomSource('voicelines')">&#127908; Voice Lines</button>
+    </div>
     <!-- Volume -->
     <div class="vol-row">
       <label>&#128266; Volume</label>
@@ -1038,6 +1069,9 @@ table.det-log tr:hover td{background:#232323}
     <h3>&#127925; Audio Clips</h3>
     <button class="accordion active">Auto (Random Pool)</button>
     <div class="panel" style="max-height: 400px;" id="auto-sounds"></div>
+
+    <button class="accordion active">Voice Lines</button>
+    <div class="panel" style="max-height: 400px;" id="voicelines-sounds"></div>
 
     <button class="accordion active">Manual Only</button>
     <div class="panel" style="max-height: 400px;" id="manual-sounds"></div>
@@ -1172,20 +1206,42 @@ function playClip(name,folder,btn){
     .then(r=>r.json()).then(d=>setAudioSt(d.message));
 }
 
+// ── Random source toggle ──────────────────────────────────────────────────────
+function setRandomSource(src){
+  fetch("/api/set_random_source/"+src).then(r=>r.json()).then(d=>{
+    setAudioSt(d.message);
+    document.getElementById("srcAutoBtn") .classList.toggle("btn-blue", src==="auto");
+    document.getElementById("srcAutoBtn") .classList.toggle("btn-grey", src!=="auto");
+    document.getElementById("srcVoiceBtn").classList.toggle("btn-blue", src==="voicelines");
+    document.getElementById("srcVoiceBtn").classList.toggle("btn-grey", src!=="voicelines");
+  });
+}
+// Highlight the default source on load
+setRandomSource("auto");
+
 function loadClips(){
   fetch("/clips").then(r=>r.json()).then(data=>{
-    const autoDiv=document.getElementById("auto-sounds");
-    const manDiv =document.getElementById("manual-sounds");
-    const auto=data.clips.filter(c=>c.folder==="auto");
-    const man =data.clips.filter(c=>c.folder==="manual");
+    const autoDiv  =document.getElementById("auto-sounds");
+    const manDiv   =document.getElementById("manual-sounds");
+    const voiceDiv =document.getElementById("voicelines-sounds");
+    const auto  =data.clips.filter(c=>c.folder==="auto");
+    const man   =data.clips.filter(c=>c.folder==="manual");
+    const voice =data.clips.filter(c=>c.folder==="voicelines");
     
     autoDiv.innerHTML="";
     manDiv.innerHTML="";
+    voiceDiv.innerHTML="";
     
     if(auto.length){
       auto.forEach(c=>autoDiv.appendChild(mkClipBtn(c)));
     } else {
       autoDiv.innerHTML='<div class="no-clips">No clips found</div>';
+    }
+    
+    if(voice.length){
+      voice.forEach(c=>voiceDiv.appendChild(mkClipBtn(c)));
+    } else {
+      voiceDiv.innerHTML='<div class="no-clips">No clips found</div>';
     }
     
     if(man.length){
@@ -1217,8 +1273,9 @@ function mkClipBtn(c){
   const b=document.createElement("button");
   b.className="clip-btn";
   const ext=c.name.split(".").pop().toLowerCase();
-  const manBadge=c.folder==="manual"?'<span class="badge-man">[MANUAL]</span>':"";
-  b.innerHTML=`${manBadge}<span class="badge-${ext}">[${ext.toUpperCase()}]</span>&#9654;  ${c.name}`;
+  const manBadge   =c.folder==="manual"     ?'<span class="badge-man">[MANUAL]</span>':"";
+  const voiceBadge =c.folder==="voicelines" ?'<span class="badge-mp3">[VOICE]</span>':"";
+  b.innerHTML=`${manBadge}${voiceBadge}<span class="badge-${ext}">[${ext.toUpperCase()}]</span>&#9654;  ${c.name}`;
   b.onclick=()=>playClip(c.name,c.folder,b);
   return b;
 }
@@ -1325,8 +1382,9 @@ function rEStop(){
 # ─── Startup ──────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    os.makedirs(AUDIO_FOLDER,  exist_ok=True)
-    os.makedirs(MANUAL_FOLDER, exist_ok=True)
+    os.makedirs(AUDIO_FOLDER,      exist_ok=True)
+    os.makedirs(MANUAL_FOLDER,     exist_ok=True)
+    os.makedirs(VOICELINES_FOLDER, exist_ok=True)
     threading.Thread(target=capture_frames, daemon=True).start()
     threading.Thread(target=capture_ceiling_frames, daemon=True).start()
     threading.Thread(target=navigation_loop, daemon=True).start()
@@ -1334,6 +1392,7 @@ if __name__ == '__main__':
     print("\n Person Detection & AutoNav running!")
     print(f" Auto clips:      {AUDIO_FOLDER}")
     print(f" Manual clips:    {MANUAL_FOLDER}")
+    print(f" Voice lines:     {VOICELINES_FOLDER}")
     print(f" Robot port:      {ROBOT_PORT}")
     print(f" Ext mic card:    {EXT_MIC_CARD} (change EXT_MIC_CARD if wrong)")
     print(f"\n Open https://<your-pi-ip>:5000\n")
